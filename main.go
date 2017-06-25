@@ -145,7 +145,6 @@ func runClient(ctx Ctx, conn net.Conn) {
 		log.Info("Closing client")
 	}()
 	reader := bufio.NewReader(conn)
-	//registered := false
 	for {
 		rawMsg, err := reader.ReadString('\n')
 		if err != nil {
@@ -160,7 +159,7 @@ func runClient(ctx Ctx, conn net.Conn) {
 			reply := Msg{Type: "error", Data: "invalid format"}
 			conn.Write([]byte(msgToJsonMsg(reply)))
 		} else {
-			reply := Msg{Type: "reply", Data: "ok"}
+			reply := Msg{Type: "ok", Data: "msg processed ok"}
 			conn.Write([]byte(msgToJsonMsg(reply)))
 		}
 		log.Infof("message %#v", msg)
