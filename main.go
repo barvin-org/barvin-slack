@@ -6,9 +6,11 @@ import (
 	"errors"
 	"github.com/gorilla/websocket"
 	"github.com/op/go-logging"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -85,6 +87,7 @@ type rtmResponse struct {
 }
 
 type ctx struct {
+	Token       string
 	Restarts    chan restart
 	SlackEvents chan string
 	UserEvents  chan interface{}
@@ -122,6 +125,23 @@ func startRtm(origin string) rtmResponse {
 	var data rtmResponse
 	json.NewDecoder(resp.Body).Decode(&data)
 	return data
+}
+
+func sendPrvMessage(ctx ctx, userID string, msg string) error {
+	token := ctx.Token
+	httpclient := &http.Client{
+		Timeout: time.Second * 3,
+	}
+	rsp, err := httpclient.PostForm("https://slack.com/api/chat.postMessage?token="+token, url.Values{"channel": {userID}, "as_user": {"true"}, "text": {msg}})
+	if err != nil {
+		log.Errorf("Error while sending private message: %s", err)
+		return err
+	}
+	io.Copy(ioutil.Discard, rsp.Body)
+	if rsp != nil {
+		rsp.Body.Close()
+	}
+	return err
 }
 
 func connectWs(url string, origin string) (*websocket.Conn, error) {
@@ -204,6 +224,7 @@ func userReceiveMessages(ctx ctx, u user) {
 func userSendMessages(ctx ctx, u user) {
 	for {
 		m := <-u.Send
+		sendPrvMessage(ctx, u.ID, m.Message)
 		log.Infof("Message for the user: %#v, for user: %s", m, u.ID)
 	}
 }
@@ -397,6 +418,7 @@ func main() {
 	loggingBackendLeveled.SetLevel(logging.DEBUG, "")
 	logging.SetBackend(backend2Formatter)
 	ctx := ctx{
+		Token:       token,
 		Restarts:    make(chan restart),
 		SlackEvents: make(chan string),
 		UserEvents:  make(chan interface{}),
