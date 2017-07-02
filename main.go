@@ -339,20 +339,16 @@ func runClient(ctx ctx, conn net.Conn) {
 					Name: decodedMsg.Data,
 					Conn: conn,
 				}
-				go func() {
-					ctx.Connections <- registered
-				}()
+				ctx.Connections <- registered
 			case "msg":
-				go func() {
-					if decodedMsg.User == "" {
-						ctx.UserEvents <- connToAllUsersMsg{Message: decodedMsg.Data}
-					} else {
-						ctx.UserEvents <- connToUserMsg{
-							UserID:  decodedMsg.User,
-							Message: decodedMsg.Data,
-						}
+				if decodedMsg.User == "" {
+					ctx.UserEvents <- connToAllUsersMsg{Message: decodedMsg.Data}
+				} else {
+					ctx.UserEvents <- connToUserMsg{
+						UserID:  decodedMsg.User,
+						Message: decodedMsg.Data,
 					}
-				}()
+				}
 			default:
 				reply = msg{Type: "error", Data: "message unknown"}
 			}
