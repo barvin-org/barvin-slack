@@ -185,7 +185,30 @@ func dispatchSlackEvents(ctx ctx) {
 	}
 }
 
-func runUsers(ctx ctx, userIds []string) {
+func userReceiveMessages(ctx ctx, u user) {
+	for {
+		m := <-u.Recv
+		if m.Type == "message" {
+			go func() {
+				ctx.Connections <- connMessage{
+					Type:   "msg",
+					Msg:    m.Text,
+					UserID: u.ID,
+				}
+			}()
+		}
+		log.Infof("Dispatching event: %#v, for user: %#v", m, u)
+	}
+}
+
+func userSendMessages(ctx ctx, u user) {
+	for {
+		m := <-u.Send
+		log.Infof("Message for the user: %#v, for user: %s", m, u.ID)
+	}
+}
+
+func usersRegistrar(ctx ctx, userIds []string) {
 	users := make(map[string]user)
 	for _, userID := range userIds {
 		u := user{
@@ -194,27 +217,8 @@ func runUsers(ctx ctx, userIds []string) {
 			Send: make(chan connReplyMsg),
 		}
 		users[userID] = u
-		go func() {
-			for {
-				m := <-u.Recv
-				if m.Type == "message" {
-					go func() {
-						ctx.Connections <- connMessage{
-							Type:   "msg",
-							Msg:    m.Text,
-							UserID: u.ID,
-						}
-					}()
-				}
-				log.Infof("Dispatching event: %#v, for user: %#v", m, u)
-			}
-		}()
-		go func() {
-			for {
-				m := <-u.Send
-				log.Infof("Message for the user: %#v, for user: %s", m, u.ID)
-			}
-		}()
+		go userReceiveMessages(ctx, u)
+		go userSendMessages(ctx, u)
 	}
 	for {
 		m := <-ctx.UserEvents
@@ -367,9 +371,9 @@ func connectionsRegistrar(ctx ctx) {
 					Data: v.Msg,
 					User: v.UserID,
 				})
-				go func() {
+				go func(conn net.Conn) {
 					conn.Write([]byte(txt))
-				}()
+				}(conn)
 			}
 		default:
 			log.Infof("Unknown connection message type: %v", v)
@@ -401,15 +405,15 @@ func main() {
 	wg.Add(5)
 	go func() {
 		defer wg.Done()
-		dispatchSlackEvents(ctx)
-	}()
-	go func() {
-		defer wg.Done()
-		runUsers(ctx, users)
+		usersRegistrar(ctx, users)
 	}()
 	go func() {
 		defer wg.Done()
 		slackHandler(ctx, token)
+	}()
+	go func() {
+		defer wg.Done()
+		dispatchSlackEvents(ctx)
 	}()
 	go func() {
 		defer wg.Done()
