@@ -22,3 +22,8 @@ The protocol is extremly simple, for now:
 - components -> connector message types:
   - `register` - register the current component - usually this message is being sent as the very first TCP connection
   - `msg` - a normal message that needs to end up in Slack
+
+### How to build
+
+- `make` - will build the project
+- `make clean` - will clean the produced artifacts
