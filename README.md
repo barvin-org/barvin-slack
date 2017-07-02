@@ -10,14 +10,15 @@ Connect the component using TCP sockets, on port 9191 (default).
 
 The protocol is extremly simple, for now:
 
-- register the component: `{"type": "register", "data": "my-fancy-component"}`;
-- send messages from the slack connector to the components (since this is a fanout implementation, all components connected at a particular time, will get a copy of the message) using the same simple json format `{"type": "msg", "data": "some data in here"}`;
-- the components can send messages to the connector, again using the same json format `{"type": "msg", "data": "some data from the component"}` - the connector will know what to do with that message based on the specified `type`;
-- the component -> connector communication is based on a req-resp pattern - that means that for every message that the component will send to the connector, there will be a json response i.e. `{"type": "ok", "data": "message successfully sent"}`, `{"type": "error", "data": "some error reason"}`;
+- register the component: `{"type": "register", "data": "my-fancy-component", "user": ""}`;
+- send messages from the slack connector to the components (since this is a fanout implementation, all components connected at a particular time, will get a copy of the message) using the same simple json format `{"type": "msg", "data": "some data in here", "user": "user id"}`;
+- the components can send messages to the connector, again using the same json format `{"type": "msg", "data": "some data from the component", "user": "some user"}` - the connector will know what to do with that message based on the specified `type`; the `user` field is optional in all messages, and when is missing, is considered to be a "for all users" message;
+- the component -> connector communication is based on a req-resp pattern - that means that for every message that the component will send to the connector, there will be a json response i.e. `{"type": "ok", "data": "message successfully sent", "user": ""}`, `{"type": "error", "data": "some error reason", "user": ""}`;
 - connector -> components message types:
   - `msg` - normal message sent to the component
   - `ok` - reply sent back to the component when the request was successfully processed/handled
   - `error` - when there was an error related to the message itself, or something was wrong on the connector side (i.e. maybe Slack was down, and the message didn't get to the destination?)
+  - `restart` - when the slack connector restarts such a message will be sent to all connected components.
 - components -> connector message types:
   - `register` - register the current component - usually this message is being sent as the very first TCP connection
   - `msg` - a normal message that needs to end up in Slack

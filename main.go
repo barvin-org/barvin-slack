@@ -3,10 +3,10 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"flag"
-	"fmt"
+	"errors"
 	"github.com/gorilla/websocket"
 	"github.com/op/go-logging"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -17,39 +17,109 @@ import (
 	"time"
 )
 
-type Restart struct {
+type slackEvent struct {
+	Type      string `json:"type"`
+	User      string `json:"user"`
+	Text      string `json:"text"`
+	Timestamp string `json:"ts"`
+}
+
+type restart struct {
 	Reason string
 }
 
-type Ctx struct {
-	Restarts    chan Restart
-	Events      chan string
-	Connections map[string]net.Conn
-}
-
-type Client struct {
+type client struct {
 	conn net.Conn
 	name string
 }
 
-type Msg struct {
+type connToUserMsg struct {
+	UserID  string
+	Message string
+}
+
+type connToAllUsersMsg struct {
+	Message string
+}
+
+type connReplyMsg struct {
+	Message string
+}
+
+type user struct {
+	ID   string
+	Recv chan slackEvent
+	Send chan connReplyMsg
+}
+
+type connRegister struct {
+	Name string
+	Conn net.Conn
+}
+
+type connUnregister struct {
+	Name string
+}
+
+type connMessage struct {
+	Type   string
+	Msg    string
+	UserID string
+}
+
+type msg struct {
 	Type string `json:"type"`
 	Data string `json:"data"`
+	User string `json:"user,omitempty"`
+}
+
+type config struct {
+	Token string   `json:"token"`
+	Users []string `json:"users"`
+	Port  int      `json:"port"`
+	Host  string   `json:"host"`
+}
+
+type rtmResponse struct {
+	URL string `json:"url"`
+}
+
+type ctx struct {
+	Restarts    chan restart
+	SlackEvents chan string
+	UserEvents  chan interface{}
+	Connections chan interface{}
 }
 
 var log = logging.MustGetLogger("main-logger")
 
-type RtmResponse struct {
-	Url string `json:"url"`
+func readConfig() config {
+	config := config{
+		Token: "",
+		Users: []string{},
+		Port:  9191,
+		Host:  "localhost",
+	}
+	file, errReadFile := ioutil.ReadFile("config.json")
+	if errReadFile != nil {
+		log.Warningf("Config file error: %s; using default values.", errReadFile)
+		return config
+	}
+	errUnmarshal := json.Unmarshal(file, &config)
+	if errUnmarshal != nil {
+		log.Warningf("Config file error: %s; using default values.", errUnmarshal)
+		return config
+	}
+	return config
 }
 
-func startRtm(origin string) RtmResponse {
+func startRtm(origin string) rtmResponse {
 	resp, err := http.Get(origin)
 	if err != nil {
-		return RtmResponse{}
+		return rtmResponse{}
 	}
 	defer resp.Body.Close()
-	var data RtmResponse
+	var data rtmResponse
 	json.NewDecoder(resp.Body).Decode(&data)
 	return data
 }
@@ -59,7 +129,7 @@ func connectWs(url string, origin string) (*websocket.Conn, error) {
 	return c, err
 }
 
-func eventsProducer(ws *websocket.Conn, ctx Ctx) {
+func eventsProducer(ws *websocket.Conn, ctx ctx) {
 	ticker := time.NewTicker(10 * time.Second)
 	stopPinger := make(chan struct{})
 	ws.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -86,40 +156,114 @@ func eventsProducer(ws *websocket.Conn, ctx Ctx) {
 			log.Errorf("Error while reading message: %v", err)
 			close(stopPinger)
 			ws.Close()
-			ctx.Restarts <- Restart{Reason: "slack read message error"}
+			ctx.Restarts <- restart{Reason: "slack read message error"}
+			go func() {
+				ctx.Connections <- connMessage{Type: "restart", Msg: "slack read message error"}
+			}()
 			break
 		}
-		ctx.Events <- string(msg[:])
+		ctx.SlackEvents <- string(msg[:])
 	}
 }
 
-func dispatchEvents(ctx Ctx) {
+func parseSlackEvent(jsonEvent string) (slackEvent, error) {
+	var event slackEvent
+	err := json.Unmarshal([]byte(jsonEvent), &event)
+	if err != nil {
+		return event, errors.New("Invalid event")
+	}
+	return event, nil
+}
+
+func dispatchSlackEvents(ctx ctx) {
 	for {
-		event := <-ctx.Events
-		log.Infof("Dispatching event: %s", event)
-		for _, conn := range ctx.Connections {
-			_, err := conn.Write([]byte(event))
-			log.Infof("Write data to connection response: %s", err)
+		jsonEvent := <-ctx.SlackEvents
+		event, _ := parseSlackEvent(jsonEvent)
+		go func() {
+			ctx.UserEvents <- event
+		}()
+	}
+}
+
+func runUsers(ctx ctx, userIds []string) {
+	users := make(map[string]user)
+	for _, userID := range userIds {
+		u := user{
+			ID:   userID,
+			Recv: make(chan slackEvent),
+			Send: make(chan connReplyMsg),
+		}
+		users[userID] = u
+		go func() {
+			for {
+				m := <-u.Recv
+				if m.Type == "message" {
+					go func() {
+						ctx.Connections <- connMessage{
+							Type:   "msg",
+							Msg:    m.Text,
+							UserID: u.ID,
+						}
+					}()
+				}
+				log.Infof("Dispatching event: %#v, for user: %#v", m, u)
+			}
+		}()
+		go func() {
+			for {
+				m := <-u.Send
+				log.Infof("Message for the user: %#v, for user: %s", m, u.ID)
+			}
+		}()
+	}
+	for {
+		m := <-ctx.UserEvents
+		switch v := m.(type) {
+		case slackEvent:
+			u := users[v.User]
+			if u != (user{}) {
+				go func() {
+					u.Recv <- v
+				}()
+			}
+		case connToUserMsg:
+			u := users[v.UserID]
+			if u != (user{}) {
+				go func() {
+					u.Send <- connReplyMsg{Message: v.Message}
+				}()
+			}
+		case connToAllUsersMsg:
+			for _, u := range users {
+				go func(u user) {
+					u.Send <- connReplyMsg{Message: v.Message}
+				}(u)
+			}
+		default:
+			log.Warningf("User event unknown: %#v", v)
 		}
 	}
 }
 
-func slackHandler(ctx Ctx, token string) {
+func slackHandler(ctx ctx, token string) {
 	origin := "https://slack.com/api/rtm.start?token=" + token
 	go func() {
-		ctx.Restarts <- Restart{Reason: "initial start"}
+		ctx.Restarts <- restart{Reason: "initial start"}
 	}()
 	for {
 		msg := <-ctx.Restarts
-		log.Infof("Restarting: %#v", msg)
-		log.Infof("No of goroutines: %d", runtime.NumGoroutine())
+		log.Infof("Restarting: %#v; no of goroutines: %d", msg, runtime.NumGoroutine())
 		rtm := startRtm(origin)
-		log.Debugf("RTM url: %s", rtm.Url)
-		ws, err := connectWs(rtm.Url, origin)
+		log.Debugf("RTM url: %s", rtm.URL)
+		ws, err := connectWs(rtm.URL, origin)
 		if err != nil {
-			log.Errorf("Error trying to connect to WS: %v", err)
+			errorMsg := "Error trying to connect to WS"
+			log.Errorf("%s: %v", errorMsg, err)
 			go func() {
-				ctx.Restarts <- Restart{Reason: "error connecting to WS"}
+				ctx.Restarts <- restart{Reason: errorMsg}
+			}()
+			go func() {
+				ctx.Connections <- connMessage{Type: "restart", Msg: errorMsg}
 			}()
 		} else {
 			go eventsProducer(ws, ctx)
@@ -128,45 +272,72 @@ func slackHandler(ctx Ctx, token string) {
 	}
 }
 
-func msgToJsonMsg(msg Msg) string {
+func msgToJSONMsg(msg msg) string {
 	json, _ := json.Marshal(msg)
 	return (string(json) + "\n")
 }
 
-func jsonToMsg(jsonString string) (Msg, error) {
-	var msg Msg
+func jsonToMsg(jsonString string) (msg, error) {
+	var msg msg
 	decodeErr := json.NewDecoder(strings.NewReader(jsonString)).Decode(&msg)
 	return msg, decodeErr
 }
 
-func runClient(ctx Ctx, conn net.Conn) {
+func runClient(ctx ctx, conn net.Conn) {
 	defer func() {
 		log.Infof("No of goroutines: %d", runtime.NumGoroutine())
 		log.Info("Closing client")
 	}()
 	reader := bufio.NewReader(conn)
+	registered := connRegister{}
 	for {
 		rawMsg, err := reader.ReadString('\n')
 		if err != nil {
 			conn.Close()
+			if registered != (connRegister{}) {
+				go func() {
+					ctx.Connections <- connUnregister{Name: registered.Name}
+				}()
+			}
 			return
 		}
+		reply := msg{Type: "ok", Data: "ok"}
 		message := strings.TrimSpace(rawMsg)
-		msg, decodeErr := jsonToMsg(message)
+		decodedMsg, decodeErr := jsonToMsg(message)
 		if decodeErr != nil {
-			log.Warningf("Error while decoding message: %s", decodeErr)
-			log.Warningf("Invalid message format: %s", message)
-			reply := Msg{Type: "error", Data: "invalid format"}
-			conn.Write([]byte(msgToJsonMsg(reply)))
+			log.Warningf("Error while decoding message: %s; invalid message format: %s", decodeErr, message)
+			reply = msg{Type: "error", Data: "invalid format"}
 		} else {
-			reply := Msg{Type: "ok", Data: "msg processed ok"}
-			conn.Write([]byte(msgToJsonMsg(reply)))
+			switch decodedMsg.Type {
+			case "register":
+				registered = connRegister{
+					Name: decodedMsg.Data,
+					Conn: conn,
+				}
+				go func() {
+					ctx.Connections <- registered
+				}()
+			case "msg":
+				go func() {
+					if decodedMsg.User == "" {
+						ctx.UserEvents <- connToAllUsersMsg{Message: decodedMsg.Data}
+					} else {
+						ctx.UserEvents <- connToUserMsg{
+							UserID:  decodedMsg.User,
+							Message: decodedMsg.Data,
+						}
+					}
+				}()
+			default:
+				reply = msg{Type: "error", Data: "message unknown"}
+			}
 		}
-		log.Infof("message %#v", msg)
+		conn.Write([]byte(msgToJSONMsg(reply)))
+		log.Debugf("message %#v", decodedMsg)
 	}
 }
 
-func tcpHandler(host string, port int, ctx Ctx) {
+func tcpHandler(host string, port int, ctx ctx) {
 	listener, err := net.Listen("tcp", host+":"+strconv.Itoa(port))
 	if err != nil {
 		log.Fatalf("Error starting TCP server on host %s, port %d", host, port)
@@ -179,22 +350,39 @@ func tcpHandler(host string, port int, ctx Ctx) {
 	}
 }
 
+func connectionsRegistrar(ctx ctx) {
+	connections := make(map[string]net.Conn)
+	for {
+		connCmd := <-ctx.Connections
+		switch v := connCmd.(type) {
+		case connRegister:
+			connections[v.Name] = v.Conn
+		case connUnregister:
+			delete(connections, v.Name)
+		case connMessage:
+			for key, conn := range connections {
+				log.Infof("Sent message to connection: %s", key)
+				txt := msgToJSONMsg(msg{
+					Type: v.Type,
+					Data: v.Msg,
+					User: v.UserID,
+				})
+				go func() {
+					conn.Write([]byte(txt))
+				}()
+			}
+		default:
+			log.Infof("Unknown connection message type: %v", v)
+		}
+	}
+}
+
 func main() {
-	userid := flag.String("userid", "", "The privileged slack userid.")
-	token := flag.String("token", "", "Slack token to connect.")
-	tcpport := flag.Int("port", 9191, "TCP listening port.")
-	tcphost := flag.String("host", "localhost", "TCP listening host.")
-	flag.Parse()
-	if *token == "" {
-		fmt.Println("Missing token.")
-		flag.PrintDefaults()
-		os.Exit(2)
-	}
-	if *userid == "" {
-		fmt.Println("Missing userid.")
-		flag.PrintDefaults()
-		os.Exit(2)
-	}
+	config := readConfig()
+	token := config.Token
+	users := config.Users
+	tcpport := config.Port
+	tcphost := config.Host
 	var wg sync.WaitGroup
 	var format = logging.MustStringFormatter(
 		`%{color}%{time:2006-01-02T15:04:05.000} %{shortfunc} >>> %{level} %{id:03x} %{message}%{color:reset}`,
@@ -204,22 +392,32 @@ func main() {
 	loggingBackendLeveled := logging.AddModuleLevel(loggingBackend)
 	loggingBackendLeveled.SetLevel(logging.DEBUG, "")
 	logging.SetBackend(backend2Formatter)
-	ctx := Ctx{
-		Restarts: make(chan Restart),
-		Events:   make(chan string),
+	ctx := ctx{
+		Restarts:    make(chan restart),
+		SlackEvents: make(chan string),
+		UserEvents:  make(chan interface{}),
+		Connections: make(chan interface{}),
 	}
-	wg.Add(3)
+	wg.Add(5)
 	go func() {
 		defer wg.Done()
-		dispatchEvents(ctx)
+		dispatchSlackEvents(ctx)
 	}()
 	go func() {
 		defer wg.Done()
-		slackHandler(ctx, *token)
+		runUsers(ctx, users)
 	}()
 	go func() {
 		defer wg.Done()
-		tcpHandler(*tcphost, *tcpport, ctx)
+		slackHandler(ctx, token)
+	}()
+	go func() {
+		defer wg.Done()
+		tcpHandler(tcphost, tcpport, ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		connectionsRegistrar(ctx)
 	}()
 	wg.Wait()
 }
