@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"runtime"
@@ -67,6 +68,10 @@ type connMessage struct {
 	Type   string
 	Msg    string
 	UserID string
+}
+
+type connQuery struct {
+	Reply chan map[string]net.Conn
 }
 
 type msg struct {
@@ -392,10 +397,23 @@ func connectionsRegistrar(ctx ctx) {
 					conn.Write([]byte(txt))
 				}(conn)
 			}
+		case connQuery:
+			go func(cmd connQuery, conns map[string]net.Conn) {
+				cmd.Reply <- conns
+			}(v, connections)
 		default:
 			log.Infof("Unknown connection message type: %v", v)
 		}
 	}
+}
+
+func debugConnsHandler(ctx ctx, w http.ResponseWriter, r *http.Request) {
+	query := connQuery{Reply: make(chan map[string]net.Conn)}
+	go func() {
+		ctx.Connections <- query
+	}()
+	conns := <-query.Reply
+	io.WriteString(w, "conns: "+strconv.Itoa(len(conns)))
 }
 
 func main() {
@@ -420,7 +438,14 @@ func main() {
 		UserEvents:  make(chan interface{}),
 		Connections: make(chan interface{}),
 	}
-	wg.Add(5)
+	wg.Add(6)
+	http.HandleFunc("/debug-connections", func(w http.ResponseWriter, r *http.Request) {
+		debugConnsHandler(ctx, w, r)
+	})
+	go func() {
+		defer wg.Done()
+		http.ListenAndServe("0.0.0.0:6060", nil)
+	}()
 	go func() {
 		defer wg.Done()
 		usersRegistrar(ctx, users)
