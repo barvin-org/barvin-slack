@@ -439,7 +439,7 @@ func main() {
 		Connections: make(chan interface{}),
 	}
 	wg.Add(6)
-	http.HandleFunc("/debug-connections", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/debug/connections", func(w http.ResponseWriter, r *http.Request) {
 		debugConnsHandler(ctx, w, r)
 	})
 	go func() {
